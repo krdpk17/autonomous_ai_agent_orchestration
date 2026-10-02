@@ -1,0 +1,13 @@
+# LLM Wire Protocol & Inference Client
+openai>=1.30.0
+
+# State Management & Pub/Sub
+redis>=5.0.0
+
+# Centralized Settings & Environment Validation
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+
+# Optional Developer Tools (Linting & Testing)
+pytest>=8.0.0

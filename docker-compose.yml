@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:alpine
+    container_name: hermes-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  hermes-orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes-agent-core
+    depends_on:
+      - redis
+    env_file:
+      - .env
+    volumes:
+      - ./workspace:/app/workspace
+    restart: "no"
