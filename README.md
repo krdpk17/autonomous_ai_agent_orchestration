@@ -38,4 +38,4 @@ The platform implements an automated pipeline where specialized LLM agents colla
                [APPROVED]                 [REJECTED]
                     │                          │
                     ▼                          ▼
-               Final Output           Self-Healing Loop / HITL(Future work)
+               Final Output           Self-Healing Loop / HITL
