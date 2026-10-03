@@ -1,11 +1,11 @@
 import sys
 import re
 import json
+import uuid
 from pathlib import Path
 import redis
 from openai import OpenAI
 
-# Resolve root path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -13,11 +13,10 @@ if str(ROOT_DIR) not in sys.path:
 from config import settings
 from orchestrator.guardrails import guardrail_interceptor, GuardrailViolation
 
-# Ensure workspace and profiles directories exist
 settings.WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 PROFILES_DIR = ROOT_DIR / "profiles"
 
-# --- Redis State & Pub/Sub Initialization ---
+# Connect to Redis
 r = redis.Redis(
     host=settings.redis.host,
     port=settings.redis.port,
@@ -25,8 +24,37 @@ r = redis.Redis(
     decode_responses=True
 )
 
+# ----------------- REDIS MEMORY & STATE LAYER -----------------
+
+class AgentMemory:
+    """Manages agent conversation context and shared state in Redis."""
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.context_key = f"session:{session_id}:context"
+        self.blackboard_key = f"session:{session_id}:blackboard"
+
+    def append_message(self, role: str, content: str):
+        """Persists a conversation message to Redis."""
+        entry = json.dumps({"role": role, "content": content})
+        r.rpush(self.context_key, entry)
+
+    def get_context(self) -> list:
+        """Retrieves full conversation context from Redis."""
+        raw_items = r.lrange(self.context_key, 0, -1)
+        return [json.loads(item) for item in raw_items]
+
+    def set_blackboard(self, field: str, value: str):
+        """Writes shared agent data (reports, status, summaries) to a Redis hash."""
+        r.hset(self.blackboard_key, field, value)
+
+    def get_blackboard(self, field: str) -> str:
+        """Reads shared agent data from the Redis hash."""
+        return r.hget(self.blackboard_key, field) or ""
+
+
 def publish_event(stage: str, status: str, details: str):
-    """Broadcasts agent lifecycle transitions to Redis Pub/Sub and console."""
+    """Broadcasts agent lifecycle transitions to Redis Pub/Sub."""
     payload = json.dumps({"stage": stage, "status": status, "details": details})
     try:
         channel_name = getattr(settings.redis, "channel", "agent_pipeline_events")
@@ -35,13 +63,13 @@ def publish_event(stage: str, status: str, details: str):
         print(f"Redis warning: {e}")
     print(f"\033[94m[{stage}]\033[0m \033[92m{status}\033[0m: {details}")
 
-# --- Remote Hermes Client ---
+# ----------------- INFERENCE & TOOLS -----------------
+
 client = OpenAI(
     base_url=settings.hermes.base_url,
     api_key=settings.hermes.api_key
 )
 
-# Hermes Native Tool Definitions
 HERMES_TOOLS_SPEC = """
 <tools>
 {
@@ -90,16 +118,11 @@ To invoke a tool, you MUST wrap your call in <tool_call> tags with JSON content:
 """
 
 def load_profile(profile_name: str) -> str:
-    """Reads system instructions and attaches Hermes native tool instructions."""
     profile_path = PROFILES_DIR / f"{profile_name}.md"
-    if not profile_path.exists():
-        raise FileNotFoundError(f"Agent profile not found: {profile_path}")
     base_prompt = profile_path.read_text(encoding="utf-8").strip()
     return f"{base_prompt}\n\n{HERMES_SYSTEM_INSTRUCTION}\n{HERMES_TOOLS_SPEC}"
 
-# --- Tool Execution Engine ---
 def execute_tool(tool_name: str, args: dict) -> str:
-    """Enforces guardrails before executing local workspace operations."""
     try:
         guardrail_interceptor(tool_name, args)
     except GuardrailViolation as gv:
@@ -133,7 +156,6 @@ def execute_tool(tool_name: str, args: dict) -> str:
     return json.dumps({"error": f"Tool '{tool_name}' not implemented"})
 
 def parse_hermes_tool_calls(text: str):
-    """Extracts Hermes native <tool_call> tags from generated text."""
     pattern = r"<tool_call>\s*({.*?})\s*</tool_call>"
     matches = re.findall(pattern, text, re.DOTALL)
     calls = []
@@ -144,17 +166,21 @@ def parse_hermes_tool_calls(text: str):
             continue
     return calls
 
-def run_agent_turn(messages: list) -> str:
-    """Executes a turn using plain text completions without provider-side tool filters."""
+def run_agent_turn(memory: AgentMemory) -> str:
+    """Executes a model turn by pulling context from and syncing responses back to Redis memory."""
+    messages = memory.get_context()
+    
     response = client.chat.completions.create(
         model=settings.hermes.model_name,
         messages=messages,
         temperature=settings.hermes.temperature
     )
     content = response.choices[0].message.content or ""
-    messages.append({"role": "assistant", "content": content})
+    
+    # Save the assistant response to Redis
+    memory.append_message("assistant", content)
 
-    # Check for native Hermes <tool_call> tags
+    # Check for tool invocations
     tool_calls = parse_hermes_tool_calls(content)
     if tool_calls:
         for call in tool_calls:
@@ -165,57 +191,63 @@ def run_agent_turn(messages: list) -> str:
             tool_output = execute_tool(fn_name, fn_args)
             publish_event("Tool Response", "RETURNED", tool_output)
 
-            # Hermes expects results formatted inside <tool_response> tags
+            # Persist tool response to Redis context
             tool_response_msg = f"<tool_response>\n{{\"name\": \"{fn_name}\", \"content\": {tool_output}}}\n</tool_response>"
-            messages.append({"role": "user", "content": tool_response_msg})
+            memory.append_message("user", tool_response_msg)
 
-        # Continue the loop so Hermes can finish after seeing tool results
-        return run_agent_turn(messages)
+        # Recurse using updated context stored in Redis
+        return run_agent_turn(memory)
 
     return content
 
-# --- Multi-Agent Orchestration Pipeline ---
-def run_orchestrator(task_prompt: str):
-    publish_event("Project Ingestion", "STARTED", f"Task: {task_prompt}")
+# ----------------- ORCHESTRATION PIPELINE -----------------
 
-    # Stage 1: Impact Analysis
+def run_orchestrator(task_prompt: str, session_id: str = None):
+    session_id = session_id or str(uuid.uuid4())[:8]
+    memory = AgentMemory(session_id)
+    publish_event("Project Ingestion", "STARTED", f"Session: {session_id} | Task: {task_prompt}")
+
+    # Stage 1: Impact Analyser
     publish_event("Impact Analyser", "STARTED", "Assessing repository dependencies and blast radius...")
-    analyser_prompt = load_profile("impact_analyser")
-    analysis_messages = [
-        {"role": "system", "content": analyser_prompt},
-        {"role": "user", "content": f"Perform an impact analysis for this requirement: {task_prompt}"}
-    ]
-    impact_report = run_agent_turn(analysis_messages)
+    memory.append_message("system", load_profile("impact_analyser"))
+    memory.append_message("user", f"Perform an impact analysis for this requirement: {task_prompt}")
+    impact_report = run_agent_turn(memory)
+    
+    # Store report in Redis Blackboard
+    memory.set_blackboard("impact_report", impact_report)
     publish_event("Impact Analyser", "COMPLETED", impact_report)
 
-    # Stage 2: Code Implementation
+    # Stage 2: SWE Coder
     publish_event("SWE Coder", "STARTED", "Writing implementation and unit tests into workspace...")
-    coder_prompt = load_profile("coder")
-    coder_messages = [
-        {"role": "system", "content": coder_prompt},
-        {
-            "role": "user",
-            "content": f"Task: {task_prompt}\n\nImpact Analysis Report:\n{impact_report}\n\nPlease generate the required source code and save it using write_file."
-        }
-    ]
-    coding_summary = run_agent_turn(coder_messages)
+    coder_memory = AgentMemory(f"{session_id}:coder")
+    coder_memory.append_message("system", load_profile("coder"))
+    coder_memory.append_message(
+        "user",
+        f"Task: {task_prompt}\n\nImpact Analysis Report:\n{memory.get_blackboard('impact_report')}\n\nPlease generate the required source code and save it using write_file."
+    )
+    coding_summary = run_agent_turn(coder_memory)
+    
+    # Store summary in Redis Blackboard
+    memory.set_blackboard("coding_summary", coding_summary)
     publish_event("SWE Coder", "COMPLETED", coding_summary)
 
-    # Stage 3: Verification & Review
+    # Stage 3: Reviewer
     publish_event("Reviewer Agent", "STARTED", "Auditing workspace implementation against guardrails...")
-    reviewer_prompt = load_profile("reviewer")
-    reviewer_messages = [
-        {"role": "system", "content": reviewer_prompt},
-        {
-            "role": "user",
-            "content": f"Original Task: {task_prompt}\n\nCoder Summary:\n{coding_summary}\n\nRead the generated files in workspace and audit them for correctness, security, and quality."
-        }
-    ]
-    review_verdict = run_agent_turn(reviewer_messages)
+    reviewer_memory = AgentMemory(f"{session_id}:reviewer")
+    reviewer_memory.append_message("system", load_profile("reviewer"))
+    reviewer_memory.append_message(
+        "user",
+        f"Original Task: {task_prompt}\n\nCoder Summary:\n{memory.get_blackboard('coding_summary')}\n\nRead the generated files in workspace and audit them for correctness, security, and quality."
+    )
+    review_verdict = run_agent_turn(reviewer_memory)
+    
+    # Store final verdict in Redis Blackboard
+    memory.set_blackboard("review_verdict", review_verdict)
     publish_event("Reviewer Agent", "COMPLETED", review_verdict)
 
-    publish_event("Orchestration Pipeline", "FINISHED", "All stages completed successfully.")
+    publish_event("Orchestration Pipeline", "FINISHED", f"Session {session_id} state persisted in Redis.")
     return {
+        "session_id": session_id,
         "impact_report": impact_report,
         "coding_summary": coding_summary,
         "review_verdict": review_verdict
